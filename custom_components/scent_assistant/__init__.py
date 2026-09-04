@@ -124,6 +124,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             timedelta(seconds=CLOUD_POLL_INTERVAL_SECONDS),
         )
 
+    # Aroma-Link's oil register is not pushed with ordinary BLE status frames.
+    # Tick once per minute; the device manager handles freshness, five-minute
+    # reads, retry backoff, and deferral during a momentary run. Other families
+    # and the existing cloud poll are deliberately unchanged.
+    if device.supports_ble_oil_poll:
+        async def _periodic_ble_oil_poll(now=None) -> None:
+            try:
+                await device.async_poll_oil()
+            except Exception:
+                _LOGGER.exception("Unexpected BLE oil poll failure")
+
+        device._unsub_ble_oil_poll = async_track_time_interval(
+            hass, _periodic_ble_oil_poll, timedelta(seconds=60)
+        )
+
     # Register services (once for all entries)
     if not hass.services.has_service(DOMAIN, SERVICE_SET_SCHEDULE):
         async def handle_set_schedule(call: ServiceCall) -> None:
@@ -189,6 +204,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok:
         device: ScentDiffuserDevice = hass.data[DOMAIN].pop(entry.entry_id)
         unsub = getattr(device, "_unsub_cloud_poll", None)
+        if unsub is not None:
+            unsub()
+        unsub = getattr(device, "_unsub_ble_oil_poll", None)
         if unsub is not None:
             unsub()
         await device.async_shutdown()

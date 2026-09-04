@@ -164,8 +164,17 @@ class DiffuserOilSensor(SensorEntity):
         return self._device.state.oil_remaining
 
     @property
+    def extra_state_attributes(self) -> dict | None:
+        if not self._device.supports_ble_oil_poll:
+            return None
+        return {
+            "last_successful_read": self._device.oil_last_received,
+            "consecutive_failed_reads": self._device.oil_failed_reads,
+        }
+
+    @property
     def available(self) -> bool:
-        return self._device.available and self._device.state.oil_remaining is not None
+        return self._device.available and self._device.oil_available
 
 
 class _OilFieldSensor(SensorEntity):

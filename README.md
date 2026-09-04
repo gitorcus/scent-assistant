@@ -142,6 +142,15 @@ The set of entities depends on which device family is connected.
 | Pause time remaining | Sensor | Seconds left in the current pause phase (Aroma-Link, BLE + Cloud) |
 | Battery | Sensor | Battery percentage (Aroma-Link models with a battery) |
 
+For Aroma-Link BLE devices, oil level is read on demand rather than included
+in ordinary power/status notifications. The integration checks once per minute
+and requests a new reading roughly every 5–6 minutes, with bounded retries
+after a failed read. Reads are deferred while a momentary diffusion run is
+active. Oil telemetry older than 15 minutes becomes unavailable on the next
+check; a confirmed 0% remains a valid reading. The oil sensor exposes
+`last_successful_read` and `consecutive_failed_reads` for troubleshooting.
+Cloud devices and other BLE protocol families retain their existing behavior.
+
 ### Scentiment Diffuser Air 2
 
 | Entity | Type | Description |
@@ -309,6 +318,17 @@ This integration was built by reverse engineering the BLE protocols of both devi
 ## &#x1F91D; Contributing
 
 Contributions are welcome! If you have a diffuser that uses the Aroma-Link or Aroma Buddy app and can help test, please [open an issue](https://github.com/mr-sparks/scent-assistant/issues).
+
+Offline oil-telemetry regression tests use Python 3.11+ and the standard library:
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+They import the real protocol, device, sensor, and entry-lifecycle modules with
+Home Assistant and transport boundaries stubbed. No Bluetooth hardware, cloud
+account, or running Home Assistant instance is contacted. These tests complement,
+but do not replace, the HACS/Hassfest checks and physical-device validation.
 
 ---
 

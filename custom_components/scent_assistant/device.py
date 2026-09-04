@@ -7,8 +7,9 @@ for other devices.
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from bleak import BleakClient, BleakScanner, BleakError
 from bleak_retry_connector import establish_connection
@@ -54,6 +55,13 @@ BLE_CONNECT_MAX_ATTEMPTS = 2
 # per device via the Momentary Duration number entity (not persisted
 # across HA restarts).
 DEFAULT_MOMENTARY_SECONDS = 30
+
+# Aroma-Link oil is query-only; ordinary power/status pushes do not refresh it.
+BLE_OIL_POLL_SECONDS = 300
+BLE_OIL_RETRY_SECONDS = 60
+BLE_OIL_STALE_SECONDS = 900
+BLE_OIL_READ_TIMEOUT_SECONDS = 45
+BLE_OIL_REPLY_TIMEOUT_SECONDS = 3
 
 
 class ScentDiffuserDevice:
@@ -130,6 +138,13 @@ class ScentDiffuserDevice:
         # State
         self._state = DiffuserState()
         self._state_callbacks: list[callable] = []
+
+        self._oil_received_at: datetime | None = None
+        self._oil_received_ts: float | None = None
+        self._oil_next_poll_ts: float = 0.0
+        self._oil_failed_reads = 0
+        self._oil_response = asyncio.Event()
+        self._oil_refresh_task: asyncio.Task | None = None
 
         # Momentary diffusion ("Diffuse Now" button): power on, then
         # auto-off after this many seconds via a background task.
@@ -246,6 +261,86 @@ class ScentDiffuserDevice:
     @property
     def available(self) -> bool:
         return self.connection_mode != "offline"
+
+    @property
+    def supports_ble_oil_poll(self) -> bool:
+        return bool(self._ble_address) and isinstance(self._protocol, AromaLinkBleProtocol)
+
+    @property
+    def oil_available(self) -> bool:
+        """Do not present an old Aroma-Link BLE value as current telemetry."""
+        if self._state.oil_remaining is None:
+            return False
+        if not self.supports_ble_oil_poll:
+            return True
+        return (
+            self._oil_received_ts is not None
+            and asyncio.get_running_loop().time() - self._oil_received_ts
+            < BLE_OIL_STALE_SECONDS
+        )
+
+    @property
+    def oil_last_received(self) -> str | None:
+        return self._oil_received_at.isoformat() if self._oil_received_at else None
+
+    @property
+    def oil_failed_reads(self) -> int:
+        return self._oil_failed_reads
+
+    async def _read_oil_level(self) -> bool:
+        """Request oil only, without changing power or the stored schedule."""
+        self._oil_response.clear()
+        if not await self._ble_execute(self._protocol.build_oil_query()):
+            return False
+        await asyncio.wait_for(
+            self._oil_response.wait(), timeout=BLE_OIL_REPLY_TIMEOUT_SECONDS
+        )
+        return True
+
+    async def async_poll_oil(self) -> None:
+        """One bounded read when due; failed reads back off to five minutes."""
+        if not self.supports_ble_oil_poll:
+            return
+        # Expire cached telemetry even when a running one-shot defers the read.
+        if self._state.oil_remaining is not None and not self.oil_available:
+            self._notify_state_changed()
+        loop = asyncio.get_running_loop()
+        if (
+            self._oil_refresh_task is not None
+            or loop.time() < self._oil_next_poll_ts
+            or self._ble_lock.locked()
+            or (self._momentary_task is not None and not self._momentary_task.done())
+        ):
+            return
+        self._oil_refresh_task = asyncio.current_task()
+        success = False
+        try:
+            success = await asyncio.wait_for(
+                self._read_oil_level(), timeout=BLE_OIL_READ_TIMEOUT_SECONDS
+            )
+        except (BleakError, asyncio.TimeoutError, OSError) as err:
+            _LOGGER.debug("BLE oil read failed on %s: %s", self._ble_name, err)
+        finally:
+            self._oil_refresh_task = None
+            # A timed-out connection must not leave an idle client held open.
+            if self._ble_client is not None:
+                self._schedule_disconnect()
+        if success:
+            self._oil_failed_reads = 0
+            self._oil_next_poll_ts = loop.time() + BLE_OIL_POLL_SECONDS
+        else:
+            self._oil_failed_reads += 1
+            retry = min(
+                BLE_OIL_POLL_SECONDS,
+                BLE_OIL_RETRY_SECONDS * 2 ** min(self._oil_failed_reads - 1, 3),
+            )
+            self._oil_next_poll_ts = loop.time() + retry
+            if self._oil_failed_reads == 1:
+                _LOGGER.warning(
+                    "No oil response from %s; retrying with bounded backoff",
+                    self._ble_name,
+                )
+        self._notify_state_changed()
 
     def register_state_callback(self, callback: callable) -> None:
         self._state_callbacks.append(callback)
@@ -655,6 +750,13 @@ class ScentDiffuserDevice:
             changed = True
         if "oil_remaining" in updates:
             self._state.oil_remaining = updates["oil_remaining"]
+            if self.supports_ble_oil_poll:
+                loop = asyncio.get_running_loop()
+                self._oil_received_at = datetime.now(timezone.utc)
+                self._oil_received_ts = loop.time()
+                self._oil_next_poll_ts = loop.time() + BLE_OIL_POLL_SECONDS
+                self._oil_failed_reads = 0
+                self._oil_response.set()
             changed = True
         if "work_remaining" in updates:
             self._state.work_remaining = updates["work_remaining"]
@@ -1226,6 +1328,11 @@ class ScentDiffuserDevice:
 
     async def async_shutdown(self) -> None:
         """Clean up resources."""
+        if self._oil_refresh_task is not None:
+            task = self._oil_refresh_task
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
         if self._momentary_task and not self._momentary_task.done():
             self._momentary_task.cancel()
         if self._ble_disconnect_task and not self._ble_disconnect_task.done():
