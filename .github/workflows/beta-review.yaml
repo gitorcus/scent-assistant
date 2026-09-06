@@ -1,0 +1,41 @@
+name: Beta Review Evidence
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    name: Offline evidence (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.12', '3.14']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Assert integration remains the exact upstream beta
+        run: git diff --exit-code ac928a73c3bed22cd00d5e5d875c6ff72445ab06 -- custom_components/scent_assistant
+      - name: Install offline review dependencies
+        run: python -m pip install -r tools/beta-review/requirements.txt
+      - name: Compile integration modules
+        run: python -m compileall -q custom_components/scent_assistant
+      - name: Architecture defect characterization (not safety acceptance)
+        run: python -B tools/beta-review/architecture.py
+      - name: Synthetic security characterization (no live endpoints)
+        run: python -B tools/beta-review/security.py
+      - name: Concurrency defect characterization (not safety acceptance)
+        run: python -B tools/beta-review/concurrency.py
+      - name: Positive beta parsing and freshness characterization
+        run: python -B tools/beta-review/parser.py

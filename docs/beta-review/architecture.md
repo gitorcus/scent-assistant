@@ -1,0 +1,153 @@
+# Scent Assistant 1.2.3-beta.1 architecture and decision review
+
+Reviewed commit: `ac928a73c3bed22cd00d5e5d875c6ff72445ab06` (`v1.2.3-beta.1`). Comparison baseline: `e377ed477eb5490d2e911cda471805cad33285ea` (`v1.2.2`). Findings refer to the unmodified beta. No Home Assistant instance or diffuser was operated. Seven focused offline probes executed real integration code with replacement Home Assistant/BLE boundaries; they are observations of existing defects, not full HA integration or physical tests.
+
+The beta is not an implementation of the proposed Ready to Serve contract. Its changes add Aroma-Link refresh, response reassembly and telemetry parsing, plus a general BLE update timestamp. That timestamp cannot satisfy the proposed oil-specific freshness contract. Existing service targeting, schedule preservation and clock behavior also need correction before a caller can depend on this integration for verified readiness. Absence of a newly proposed feature is a readiness-contract gap, not automatically an upstream regression.
+
+The beta also makes useful corrections that should be preserved: it separates configured work/pause durations from live remaining-time counters (`protocol_ble.py:585-622`), queries the relevant Aroma-Link work and frequency registers (`:414-433`), reassembles bounded multi-notification frames with checksum checks (`:497-518`), and adds opt-in periodic BLE refresh without making every protocol reconnect (`device.py:1128-1140`; `protocol_ble.py:203-208`, `:371`). The complete release decision also depends on the independent parser, concurrency and security reviews.
+
+## Confirmed findings
+
+### A1 — P1: a normal schedule target controls nothing; omitting it controls every configured diffuser
+
+**Source:** `custom_components/scent_assistant/__init__.py:64`, `:166-175`, `:189-194`; `custom_components/scent_assistant/services.yaml:1-74`.
+
+**Trigger:** invoke `scent_assistant.set_schedule` with an ordinary entity ID such as `switch.synthetic_diffuser`. The handler compares this value with `hass.data[DOMAIN]` keys, which are config-entry IDs. No match logs an error and returns successfully. The documented action has no target selector; omitting `entity_id` selects every device in the integration.
+
+**Offline result:** an ordinary entity target invoked zero fake devices; the same call without a target invoked both configured fake devices. This is inherited from v1.2.2.
+
+**Impact:** targeted automation silently fails; using the documented untargeted action may overwrite schedules across devices as more are added.
+
+**Minimal direction:** require an explicit correctly typed device target, resolve it using HA registries, and reject missing/unknown targets. If backward compatibility requires the existing field, implement and document its actual entity resolution rather than comparing unlike IDs. Return actionable HA service errors. Home Assistant's current [service targeting guidance](https://developers.home-assistant.io/docs/dev_101_services/) says to target the resource actually operated on and require a target when one is needed.
+
+### A2 — P1: partial schedule edits and cloud disable calls can enable a program
+
+**Source:** `custom_components/scent_assistant/device.py:989-998`, `:1024-1028`, `:1073-1099`, `:1112-1121`; `custom_components/scent_assistant/protocol_ble.py:1185-1199`; `custom_components/scent_assistant/protocol_cloud.py:334-343`. Related day-pattern overwrite: `custom_components/scent_assistant/time.py:62-74`, `:105-116`.
+
+**Trigger:** after an AK V3 program has been disabled, change Work Duration, Pause Duration, Intensity or Schedule mode. These paths call `_write_schedule_to_device` without `enabled`; its default is `True`. Separately, explicitly request `enabled=False` for a cloud schedule: the device manager does not forward that argument to the cloud client, whose default is also `True`.
+
+**Offline result:** a duration-only AK edit with cached `schedule_enabled=False` produced enable byte `0x03`. A cloud disable request reached the replacement cloud client as `enabled=True`. Both are inherited from v1.2.2.
+
+**Impact:** an edit to one setting changes whether the device may spray. Time-entity edits also explicitly replace a selective day mask with all days. These behaviors directly conflict with the proposed rule that omitted RTS fields remain untouched.
+
+**Minimal direction:** distinguish unspecified from explicit true/false, preserve authoritative untouched fields, forward `enabled` through the cloud boundary, and preserve the day mask for time-only edits. When a protocol requires a complete schedule write, obtain the necessary valid current schedule or fail clearly before writing. Do not synthesize a complete physical schedule from UI defaults.
+
+### A3 — P2: the shared weekday representation is passed unchanged into a differently encoded AK protocol
+
+**Source:** `custom_components/scent_assistant/const.py:440-446`; `custom_components/scent_assistant/__init__.py:40-47`, `:154-160`; `custom_components/scent_assistant/device.py:1096-1099`; `custom_components/scent_assistant/protocol_ble.py:135-139`, `:1181-1184`, `:1200-1204`.
+
+**Trigger:** request Monday only. The service builds mask `0x01` using a Monday-first definition. AK state and schedule documentation in the same source define bit zero as Sunday, but the device manager passes `0x01` through unchanged. The inverse issue exists when AK-native cached masks are treated as generic values.
+
+**Offline result:** an AK Monday request emitted day-mask byte `0x01`; the protocol's documented Monday byte is `0x02`. This is an inherited encoding mismatch. Its physical effect follows the protocol definition; no device test was performed.
+
+**Minimal direction:** use a canonical day set at the API boundary and encode/decode it separately for each protocol. Test individual Monday and Sunday selections, weekdays/weekends, all days and read-modify-write preservation; all-days tests alone conceal this error.
+
+### A4 — P2: Sync Time can report success without sending a clock write
+
+**Source:** `custom_components/scent_assistant/device.py:283-289`, `:455-464`, `:1259-1264`; `custom_components/scent_assistant/button.py:84-90`; inaccurate broad documentation at `README.md:31`.
+
+**Trigger:** press Sync Time while an existing BLE connection is usable. `sync_time` clears a flag and calls `_ble_connect`, whose already-connected branch returns immediately. No clock command is sent. For non-AK/non-Aromely protocols the flag also persists across disconnects, despite the README claiming synchronization on every connection.
+
+**Offline result:** `sync_time()` returned `True` with zero `_ble_send` calls on an already-connected Aroma-Link device. Inherited from v1.2.2.
+
+**Impact:** the current button cannot satisfy an explicit clock-write requirement, and its success message is stronger than the action performed.
+
+**Minimal direction:** make explicit sync an operation that ensures a connection then sends a clock command regardless of the connection fast path. Return `unsupported`, `sent_unverified` or a verified outcome according to actual protocol capability. Add the separately required eight-hour scheduling and diagnostics; neither exists in this beta. Supply time in HA's configured timezone rather than relying on process-local `datetime.now()` (`protocol_ble.py:453-455`, `:1061-1062`).
+
+### A5 — P2 contract gap: the new general timestamp cannot establish oil-specific freshness
+
+**Source:** `custom_components/scent_assistant/device.py:630-717`, `:725-729`; `custom_components/scent_assistant/sensor.py:166-175`.
+
+**Trigger:** receive a valid oil percentage once, then receive power, fan, schedule, firmware or other recognized state responses while later oil queries receive no response. All those updates assign `_ble_last_update`, and Oil remaining exposes that general timestamp as `last_device_update`.
+
+**Impact:** a consumer interpreting this attribute as oil-response time would consider stale oil freshly read after unrelated telemetry. The attribute is explicitly named `last_device_update`, and the underlying property documents a general device update, so advancing it on another device field is not itself an internal correctness defect. The confirmed gap is that the new beta attribute does not meet the proposed oil-specific requirement; a dedicated oil timestamp is absent. Same-value oil responses do currently enter the update path; equality suppression is not the issue. Cloud oil updates have no corresponding timestamp (`device.py:1191-1192`).
+
+**Minimal direction:** maintain an oil-specific valid-response timestamp, updated on every valid oil response including identical values. Other fields, invalid packets and restored values must not advance it. Preserve the last valid oil value; expose stale/invalid/restored status without introducing an age-only unavailable policy.
+
+### A6 — P2: failed platform setup leaves timers and a retained device behind
+
+**Source:** `custom_components/scent_assistant/__init__.py:109-140`, `:196`, `:200-210`; `custom_components/scent_assistant/device.py:487-497`, `:1274-1287`.
+
+**Trigger:** device setup succeeds and registers polling, then platform forwarding raises. The device is already in `hass.data`, polling callbacks are already scheduled, and no setup-failure cleanup runs. A failed setup need not pass through successful `async_unload_entry` cleanup.
+
+**Offline result:** a synthetic platform failure left one active BLE refresh timer and the device in `hass.data`; `async_shutdown` was not called. Cloud polling has the same inherited ownership pattern; beta extends the exposure to periodic BLE polling.
+
+**Impact:** a failed or retried setup can leave duplicate owners reconnecting or updating after the configuration entry fails. Normal shutdown also cancels but does not await its tasks and bypasses `_teardown_ble_client`, omitting the stop-notify sequence that the integration itself calls important for AK V3 (`device.py:499-525`). In-flight operation/unload races require the independent concurrency review.
+
+**Minimal direction:** bind timer/task/subscription lifetimes to the config entry, clean up in setup-failure paths, drain owned tasks, unsubscribe callbacks, and use one idempotent teardown path. The current HA [unloading contract](https://developers.home-assistant.io/docs/core/integration-quality-scale/rules/config-entry-unloading/) explicitly covers owned subscriptions/connections and provides setup-failure cleanup hooks. Normal polling contention and unload cancellation need terminal results, not orphaned readiness operations.
+
+### A7 — P2: service input validation accepts impossible times before changing device state
+
+**Source:** `custom_components/scent_assistant/__init__.py:55-56`, `:162-164`; `custom_components/scent_assistant/device.py:1012-1017`; `custom_components/scent_assistant/time.py:54-56`, `:97-99`.
+
+**Trigger:** call the schedule service with `start_time: "24:99"`. Its schema accepts arbitrary strings; splitting and converting to integers does not enforce clock bounds.
+
+**Offline result:** hour `24` and minute `99` reached the device schedule method. Inherited from v1.2.2.
+
+**Impact:** invalid values reach schedule state and packet builders; `time(...)` entity access can then raise. Other malformed formats can raise unhelpful generic exceptions. Protocol response validation remains a separate necessary gate.
+
+**Minimal direction:** parse and validate supported time forms and ranges before mutating cached state; use the same domain validation at the device boundary for direct callers. Reject invalid requests with a useful HA error.
+
+## Complete decision matrix
+
+Statuses describe this beta, not whether a proposal was previously accepted. Corrections below are reviewer recommendations unless explicitly marked as requirements.
+
+| Item | Review requirement and approval boundary | Beta status and evidence | Required clarification or correction |
+|---|---|---|---|
+| 1. Ready to Serve | General per-device Power/Fan/Program recipe; each No change/On/Off; persistent CONFIG entities; edit without actuation; explicit execution; structured result; edits invalidate Ready. | **Missing.** Only `set_schedule` is registered (`__init__.py:38`, `:142-194`). Buttons are Sync Time and Aroma-Link Diffuse Now (`button.py:27-31`). Existing CONFIG select directly writes schedules (`select.py:51`, `:80-81`); CONFIG classification alone is not persistence. | Keep desired recipe separate from observed device state and persist a recipe revision. Execute a snapshot. Reject capability conflicts before writes. Existing Program is independent only on AK V3 (`switch.py:123-155`); do not expose V2's power alias as an independent guaranteed field. No household services should be dependencies. |
+| 2. Fresh response proof | Requested fields require fresh valid device evidence; mismatches, timeout, unsupported and invalid responses are distinct. | **Missing/conflicting implementation.** `_ble_execute` returns transport success after a one-second sleep (`device.py:603-617`); setters then overwrite state optimistically (`:788-806`, `:843-853`). | A receive generation proves arrival order, not when the device sampled the state or which command caused it. Establish protocol-specific request/session correlation; when that cannot establish the claimed proof, report the limit instead of calling it verified. |
+| 3. AK/V3 post-stop reconnect | After requested stop writes, establish a fresh protocol-specific session and read stopped state. Credential change is deferred. | **Missing.** Power-off follows the common write path; there is no mandatory fresh-session stop verification (`device.py:788-797`). Connect already performs AK handshake and state queries (`:362-415`). | Arm verification/session ownership **before** connecting. A baseline taken after reconnect can discard valid readback delivered during its handshake and then time out waiting for a response the protocol will not repeat. Accept only eligible responses from the fresh session and reject callbacks from the old client. Do not apply reconnect behavior to all protocols. |
+| 4. Eight-hour clock writes | Automatic explicit write every eight hours; attempt/success/result/reason diagnostics; no availability failure solely because clock sync fails. Retry cadence/alerts undecided. | **Missing.** Existing interval is five-minute Aroma-Link telemetry (`const.py:427-435`, `__init__.py:128-140`), not clock scheduling. Existing one-time/session logic has A4. No clock diagnostics. | Replace the assistant-added “next usable connection once due” with a scheduler that initiates an attempt when due. Offline or queued states must be visible as overdue/attempted, never silently treated as on schedule. Exact phase, retry policy and queue latency limits remain decisions; eight-hour writes cannot be guaranteed while HA/BLE is offline. |
+| 5. Optional clock readback | Verify fresh readback where supported; otherwise `sent_unverified`, not false failure or verified. | **Partial capability primitive; missing result contract.** Base `build_time_sync` may return None (`protocol_ble.py:214-216`); no explicit readback capability/result. | Declare write and read capabilities separately. A supported write without readback is legitimate sent-unverified. Never infer readback support from a method name or from successful connection. |
+| 6. Visible operation activity and coordination | Per-device queued/running monitor; operation/start/count; publish result before idle; serialize operations; normal contention must not fail requests. Fairness, stop priority, queue policy and cancellation are not approved policies. | **Missing; guard is partial.** `_ble_lock` only covers connection/teardown; writes and verification are outside (`device.py:304`, `:603-617`). Periodic refresh skips an already-active momentary task (`:1128-1140`). Sensor registration contains no operation monitor (`sensor.py:29-71`). | Cover complete per-device operations including cloud, refresh, clock and command verification. Visible activity is informational; internal serialization closes the race. Give each call a result ID so waiting for idle cannot consume somebody else's completion. Evaluate bounded queues, refresh coalescing, stop deadline priority and cancellation independently before selecting policy. |
+| 7. Status race protection | Delayed pre-command replies cannot overwrite newer authoritative state or satisfy verification. | **Missing.** Notifications directly modify fields and protocol caches (`device.py:619-729`; `protocol_ble.py:1340-1362`). | Track session and command epochs for both state publication and verification. An epoch stamped only when a notification arrives is insufficient. Reset parser session state and bind the notification callback to the client/session identity. Protocols with indistinguishable responses require an honest proof limitation. |
+| 8. Timed-run activity/provenance | Distinguish device-report, controller estimate and observed command origin; restart must not invent origin; deadline expiry does not prove stopped. | **Partial underlying timer; missing public status/provenance.** Aroma-Link's run is explicitly controller-timed (`device.py:810-840`). Remaining-time sensors are device phase snapshots (`sensor.py:265-297`), not the momentary controller's deadline. | Correct the assistant-added “device-timed only” scope. Model controller-owned Aroma-Link runs as well. `unknown/external observation` is appropriate when origin is not known; never classify vendor app vs physical controls from BLE state alone. |
+| 9. Invalid-value protection | Validate before protocol/device caches and entity updates; retain last valid value with invalid/stale metadata; invalid required RTS field cannot prove success. | **Partial framing checks; missing semantic contract.** Aroma-Link checksum/reassembly exists (`protocol_ble.py:497-518`), but oil >100 is clamped (`:624-628`), unknown phase maps to idle (`:383-391`), and the device blindly applies parsed fields (`device.py:630-717`). A7 also covers outgoing inputs. | Validate field domains and combinations before mutating either protocol caches or public state. Checksums are not semantic validation. Invalid booleans/enums must not become false/default states; track invalid required-field response outcomes separately from missing responses. |
+| 10. Oil-specific update time | Valid actual oil responses, including identical readings, advance oil time; other fields/restoration do not; no age-only unavailable rule. | **Partial; requirement gap A5.** New beta sensor attribute uses a correctly general BLE timestamp (`sensor.py:166-175`), not oil-specific evidence. Last value is retained without an age cutoff (`:178-179`); no restoration mechanism found. | Introduce oil-specific freshness for both BLE and cloud. Restored timestamps remain historical and explicitly marked restored; never stamp startup time as response time. Preserve valid zero oil. |
+| 11. Automatic timed-run shutoff | Strong maintainer recommendation, **not an approved implementation requirement**; evaluate persisted deadlines, recovery, superseding commands and controller ownership. | **Partial existing timer; recommendation unimplemented.** Timer is memory-only (`device.py:138-141`, `:810-840`) and cancelled at shutdown (`:1276-1277`). Momentary duration resets at restart (`number.py:115-122`). | Recommend durable run identity/deadline/ownership, recovery readback, and conditional stop only when ownership remains valid. Do not claim this guarantees a cutoff while HA/BLE is offline. Native device timers, where independently supported, are stronger but not universal. Do not silently promote this recommendation to required new behavior. |
+| 12. 600-second acceptance | Accept the upstream 600-second ceiling rather than maintaining a custom 610 limit; no household credentials in public code. | **Implemented at public number/service surfaces.** Work and momentary numbers cap at 600 (`number.py:48-50`, `:129-131`); schedule schema also caps work at 600 (`__init__.py:57-59`). | Treat 600 as the accepted caller/configuration value. Existing saved 610 values and consumer assumptions need a scoped compatibility check before deployment; no private configuration was inspected. Credential handling remains under the independent security review and credential changes remain deferred. |
+
+## Corrections to assistant-added assumptions and unresolved policy
+
+1. **“New generation” is not equivalent to “caused by this request.”** Test a delayed packet generated before a write but delivered after its generation counter is incremented. It must neither prove the request nor overwrite a later authoritative observation. Use echoed request IDs or device sequence/timestamp data when available. A new transport session plus valid post-write readback can establish a stronger observation boundary, but the exact firmware's response semantics still need evidence. No generic implementation should claim causality merely from arrival time.
+
+2. **A reconnect baseline cannot be taken after an opaque handshake that already queries state.** Current AK connect performs multiple reads. Construct the expected-field verifier and new-session callback before the handshake; decide which handshake responses are eligible. Do not reset the baseline again afterward and discard the only useful replies. If handshake state cannot satisfy a field, issue a supported field-specific query after connecting. `build_query()` for AK currently reads device information (`protocol_ble.py:1043-1044`), so calling generic refresh after reconnect is not a guarantee of power/fan/program responses.
+
+3. **Eight-hour explicit synchronization must schedule work when due.** “At next usable connection” can defer forever for an idle device and therefore does not satisfy the requirement. Separate intended cadence, due time, attempted write and successful write; keep offline/overdue visibility. AK's extra per-session time writes are a protocol prerequisite and can coexist with the maximum maintenance interval. Retry cadence, initial phase, handling of long operation queues and alert delivery remain undecided.
+
+4. **Visible idle cannot be the consumer's lock or completion correlation.** Another caller can enqueue immediately after an idle observation. Serialize internally and return an operation ID/result for the specific request, including terminal cancellation. Publish a final result before decrementing the last queued/running count to zero. A recipe edited during execution must not let the old operation mark the new revision Ready. A no-op recipe should explicitly report no requested fields rather than relying on vacuous all-fields verification.
+
+5. **One scalar current state is insufficient for composite schedule writes.** Preserve per-slot valid schedules and transport-specific field ownership. Current cache selects a schedule while packet builders can rewrite a full program; unknown/default values are not authoritative. V2 Program aliases Power, while V3 Fan/Program values come from different responses than some control-mask bits. Detect impossible combinations such as independent requests for aliased fields before mutating the device.
+
+6. **Timed-run status must include controller-timed runs.** An Aroma-Link momentary run has a controller deadline even though the device reports an unrelated spray/pause countdown. Keep both with their origin and observation time. When a deadline expires, transition to stop due/pending/failed until actual readback verifies stopped. Restoration may recover the integration's stored intent but cannot attribute an intervening external change to a particular app or physical control.
+
+7. **Priority and recovery choices remain recommendations.** Consider coalescing superseded background refreshes, FIFO user work and bounded latency for overdue controller-owned stops; test starvation and cancellation. These are candidate policies, not established requirements. A queued stop must not cancel a newer user's intentional run, and preemption must not interrupt a composite write into an undocumented half-applied state.
+
+8. **Readiness is a qualified observation, not a durable physical promise.** Include operation ID, recipe revision, desired/requested fields, valid observed fields, response provenance, completion time and field-level reason. Editing a recipe invalidates its previous result. A later valid device mismatch should also invalidate a current Ready presentation, while historical operation results remain immutable. Transport acceptance, HA service completion and observed physical readiness remain distinct evidence levels.
+
+## HA lifecycle and compatibility follow-through
+
+The integration's platform setup/unload entry points exist, and cloud clients correctly avoid closing HA's shared HTTP session (`protocol_cloud.py:458-461`). Remaining ownership issues are concrete: entity constructors register callbacks but provide no unregister handle (`device.py:264-265`; for example `sensor.py:151-155`); setup failure lacks cleanup; and cloud config flow retains its owned client while waiting in the device-selection step (`config_flow.py:206-218`, `:243-256`). Abort or duplicate-device paths need cleanup as well.
+
+Cloud login collapses authentication and transient connectivity failures into `False` (`protocol_cloud.py:145-199`); setup returns `False` (`__init__.py:84-89`) and no reauth flow exists. HA expects retryable setup failures to raise `ConfigEntryNotReady` and expired credentials to use an authentication failure/reauth path. This is an inherited recovery limitation, not a beta-only regression. See the official [setup-failure guidance](https://developers.home-assistant.io/docs/integration_setup_failures/). Addressing failure handling does not require changing or accessing device credentials during this review.
+
+BLE configuration uses direct `BleakScanner.discover` (`config_flow.py:126-130`) even though connection code consults HA's Bluetooth cache (`device.py:312-332`). That makes remote-proxy-only onboarding and shared-scanner integration an unverified compatibility boundary; no proxy-only environment was exercised. HA's [Bluetooth API guidance](https://developers.home-assistant.io/docs/core/bluetooth/api/) provides shared scanner and discovery APIs. Do not advertise automatic discovery merely from manifest matchers when the config flow implements no `async_step_bluetooth`.
+
+Release validation must include actual supported HA versions, not only these stubs. Source uses seven platforms (`__init__.py:36`), unbounded minimum BLE dependencies (`manifest.json:21`), and version-one config entries (`config_flow.py:34`). Existing entity unique IDs and config-entry identity should remain stable when introducing recipe/diagnostic entities. A future recipe persistence schema needs migration and reload tests, including optional protocol capabilities, unsupported clock readback, cloud-only entries, unavailable first connect and partial platform failure. Dependency/CI/security conclusions belong to the separate release and security reviews.
+
+Local consumer compatibility is **unknown**: no private dashboard, worker, installed component, runtime entity registry or saved configuration was inspected. A public contract cannot assume that local consumers only use documented public services; an inventory of private method dependencies, duration values, entity IDs and scheduling ownership is a separate deployment gate. Installing a fork under the same integration domain replaces that component implementation, so package source/update policy and rollback need explicit selection.
+
+Before any production rollout: agree the exact corrected source and exported API; run protocol/capability and HA setup/unload/reload tests; compare the installed and candidate component and consumer interfaces; prepare a versioned rollback of source and affected persisted data; then obtain the specific deployment approval required for that environment. Passing offline probes or local HA tests provides no physical acceptance. Any eventual authorized device validation must separately distinguish write acceptance, fresh device response, and observed physical operation.
+
+## Highest-value independent Claude validation prompts
+
+Ask Claude to challenge the exact fork commit with synthetic, adverse sequences rather than assuming this design is sound:
+
+1. Demonstrate that delayed pre-command responses cannot satisfy RTS or regress state, including a packet delayed across a disconnect, a packet from an old callback, and a packet arriving during reconnect handshake before the caller resumes. Explain precisely what proves freshness for each protocol and what remains unprovable.
+2. Execute a matrix of Power/Fan/Program No change/On/Off for supported families, including aliases, unavailable initial state, disabled schedules, multiple stored slots and partial write failure. Prove all omitted fields and untouched schedule details remain unchanged on the wire.
+3. Advance a fake clock through eight hours with no user activity, an existing connection, an offline device, restart, queue contention and a timezone/DST change. Assert an explicit due-time attempt and truthful result/overdue metadata, without treating missing readback as failure.
+4. Interleave refresh, RTS, ordinary writes, recipe edits, two timed runs and unloading. Prove one per-device owner, per-request terminal results, no false contention failure, no stale result marking a new recipe Ready, and no old deadline stopping a superseding run. Explain queue fairness and stop priority as proposed policy.
+5. Make platform setup fail after device construction, abort cloud setup during selection, fail/retry cloud authentication, and reload during in-flight operations. Assert that every old timer, task, callback and client becomes unreachable or stopped before a new instance acts.
+6. Test a normal single-device service target and an omitted target, invalid times and booleans, all weekday mappings, cloud `enabled=False`, and same-value oil readback. Require typed failures, no unintended broadcast or enablement, correct native day encoding, and oil timestamps changed only by valid oil responses.
+
+The reproduction helper `tools/beta-review/architecture.py` currently asserts the observed bad behaviors so reviewers can confirm them against the exact beta. For regression tests after fixes, invert those assertions to express the intended contract. Do not count a passing defect-reproduction script as proof that the integration is fixed.
