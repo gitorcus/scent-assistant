@@ -140,7 +140,25 @@ roots and intermediates. Distinguish missing CA, incomplete chain, private/local
 trust and outdated bundle. A laptop/public-chain success does not establish HA
 compatibility. If not tested in a suitable runtime, explicitly leave unresolved.
 
-Read certificate-trust.md. Evaluate existing HA/Let's Encrypt/Certificate Expiry
+Item #10 / SEC-1 is ACTIVE approved remediation, no longer deferred, but is not
+implemented. This prompt is still read-only validation, not approval to deploy.
+Read certificate-trust.md and preserve the approved trust-once requirement:
+normal public trust needs no extra prompt; additional CA trust needs explicit
+initial approval before credential-bearing requests; persist trust only for the
+intended endpoint. Valid server-certificate renewals under the approved CA must
+work automatically without reapproval. Authenticated CA transitions may proceed
+automatically; a genuinely new untrusted authority requires explicit approval.
+Do not confuse a CA-trust decision with pinning each short-lived server certificate.
+
+Validate separate Reload trust (reuse saved approval) and Review and re-pin
+(show changes, explicitly approve replacement) paths. Test restart persistence,
+ordinary renewal without prompts, authenticated/unproven CA transitions,
+re-pin cancellation/failure retaining old approval, and unrelated BLE entries
+remaining unaffected. No global trust changes or silent verification bypass.
+If the feature is absent, report the missing approved requirement rather than
+claiming its future acceptance tests passed.
+
+Evaluate existing HA/Let's Encrypt/Certificate Expiry
 facilities before proposing a new integration. Seek a secure normal-user path
 without manual CA files: correct vendor chain, maintained HA trust, or a vetted
 vendor-specific scoped context with rotation/revocation. Do not silently install

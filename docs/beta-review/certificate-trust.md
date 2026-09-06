@@ -1,12 +1,83 @@
 # Certificate trust: secure compatibility without user certificate expertise
 
-This is a research/design follow-up, **not approval to change trust stores or
-build/deploy another integration**. No certificate or TLS setting was changed.
+Status: **ACTIVE — approved requirement for planned remediation of item #10
+(SEC-1); no longer deferred. Not yet implemented.**
+
+Here, item #10 refers to the numbered unresolved-defects summary, not item 10
+(oil freshness) in the separate RTS decision matrix.
+
+This records the approved design direction. This documentation update does not
+change integration code, production trust stores, or TLS behavior, and does not
+authorize building/deploying a separate trust-management integration.
+
+## Approved requirement: trust once, renew automatically
+
+Ordinary users must not need to obtain CA files or repeatedly approve routine
+certificate renewals. Preserve these requirements together:
+
+1. **Normal public trust first.** A valid vendor connection already trusted by
+   HA requires no custom pin or extra approval.
+2. **Explicit initial approval when additional CA trust is needed.** During
+   cloud setup, identify the intended endpoint and proposed authority, present
+   its identity/fingerprint and trust scope, and obtain approval before storing
+   that trust or sending account credentials through it. Establish the CA's
+   identity through a documented trustworthy process; a confirmation dialog
+   alone does not authenticate whatever an unverified endpoint supplies.
+3. **Persist narrowly scoped CA trust.** Save the approved authority for the
+   intended Scent Assistant cloud endpoint, surviving integration reloads and
+   HA restarts. Do not add it to HA's global trust store. BLE-only setup is not
+   subject to this cloud trust flow.
+4. **Accept ordinary renewals automatically.** Renewed server certificates
+   that validate for the intended hostname through the approved CA continue
+   working without reapproval or manual re-pinning. Do not pin a short-lived
+   server certificate in a way that breaks this requirement. The vendor issues
+   and renews its certificates; Scent Assistant validates the renewed chain.
+5. **Support authenticated CA transitions.** A cryptographically validated
+   rollover or cross-signed path rooted in existing approved trust may proceed
+   automatically under a documented, tested policy preserving that trust's
+   constraints. Merely receiving a new CA from an authenticated server is not
+   permission to promote it to an independent trust anchor. The policy must
+   explicitly define any persistent successor-anchor promotion. A genuinely
+   new untrusted authority requires explicit
+   approval; silently accepting any replacement is not renewal handling.
+6. **Provide Reload trust.** Rebuild the scoped connection context and reconnect
+   using the saved approval. Reload must not replace the approved authority.
+7. **Provide Review and re-pin.** Show the saved and proposed authority and what
+   changed; require approval before atomically replacing trust and reconnecting.
+   Cancellation or a failed replacement test must not erase the saved approval
+   or silently fall back to disabled verification.
+8. **Keep validation and recovery honest.** Continue hostname/chain validation;
+   reject invalid connections rather than treating initial approval as a
+   permanent exception for expired or wrong-host certificates. An unexpected
+   trust change raises a clear repair action for the affected cloud connection,
+   not routine renewal prompts or a failure of unrelated BLE entries.
+
+The approval/trust bootstrap mechanism, exact CA-pin representation and
+authenticated rotation mechanism remain implementation design details to
+validate. They must satisfy the user-facing continuity and approval rules above.
+
+## Acceptance checks for item #10
+
+- An already trusted public chain connects without a custom trust prompt.
+- Initial extra trust requires approval before credentials are sent; rejection
+  leaves no new stored approval and no credential-bearing request.
+- Restart and Reload trust retain the same approved authority.
+- A renewed valid server certificate under that authority succeeds automatically,
+  with no user prompt. A proven CA transition also follows its tested automatic
+  path; an unproven replacement does not.
+- Review and re-pin requires approval, updates only the intended connection,
+  and preserves the old approval on cancellation or failed replacement.
+- Wrong-host, expired and untrusted chains fail clearly with no verification
+  bypass; unrelated entries and BLE operation remain unaffected.
+- Trust setup, persistence, renewal, rotation and recovery tests run in an
+  isolated supported HA runtime before production rollout. No current test
+  result establishes this proposed behavior, because it is not implemented.
 
 ## What is known and unknown
 
-The beta cloud client passes `ssl=False`, disabling server-certificate
-verification. That is confirmed. Why this was originally necessary, whether a
+The beta cloud client uses HTTPS with `ssl=False`, disabling server-certificate
+verification, not HTTPS encryption. That is confirmed. Why this was originally
+necessary, whether a
 vendor root/intermediate is missing in HA, and whether verification currently
 works from the target HA runtime are **not established**. A valid connection
 from a developer's laptop would not answer the HA-runtime question.
