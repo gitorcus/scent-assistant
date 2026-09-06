@@ -143,18 +143,33 @@ compatibility. If not tested in a suitable runtime, explicitly leave unresolved.
 Item #10 / SEC-1 is ACTIVE approved remediation, no longer deferred, but is not
 implemented. This prompt is still read-only validation, not approval to deploy.
 Read certificate-trust.md and preserve the approved trust-once requirement:
-normal public trust needs no extra prompt; additional CA trust needs explicit
-initial approval before credential-bearing requests; persist trust only for the
+normal public trust needs no extra prompt; CA-verified setup needs explicit
+initial approval of additional trust before credential-bearing requests; persist trust only for the
 intended endpoint. Valid server-certificate renewals under the approved CA must
 work automatically without reapproval. Authenticated CA transitions may proceed
 automatically; a genuinely new untrusted authority requires explicit approval.
 Do not confuse a CA-trust decision with pinning each short-lived server certificate.
 
+Users must also have an explicit Continue without certificate verification
+choice during setup and later reconfiguration. This is distinct from Cancel:
+cancel sends no new credential-bearing setup request; choosing verification off
+allows HTTPS credential-bearing requests with ssl=False and no CA approval.
+Explain the missing identity verification once, require no justification, keep
+a visible unverified setting, and persist the mode across reload/restart without
+recurring blocking prompts. Do not call it unencrypted or verified. Test this
+choice separately from verified modes: wrong-host/expired/untrusted certificates
+must fail in verified mode but are not validation blockers in explicitly chosen
+verification-off mode. Other connection/authentication failures still apply.
+No verification failure may silently change the selected mode. Test switching
+back to verified mode and do not claim success before its validation succeeds.
+
 Validate separate Reload trust (reuse saved approval) and Review and re-pin
 (show changes, explicitly approve replacement) paths. Test restart persistence,
 ordinary renewal without prompts, authenticated/unproven CA transitions,
 re-pin cancellation/failure retaining old approval, and unrelated BLE entries
-remaining unaffected. No global trust changes or silent verification bypass.
+remaining unaffected. Reload retains the selected mode and saved trust. No
+global trust changes or silent verification bypass; the explicit opt-out above
+is an approved requirement, not a reason to reject the design as noncompliant.
 If the feature is absent, report the missing approved requirement rather than
 claiming its future acceptance tests passed.
 
@@ -164,7 +179,7 @@ without manual CA files: correct vendor chain, maintained HA trust, or a vetted
 vendor-specific scoped context with rotation/revocation. Do not silently install
 roots from an unverified endpoint or modify shared global trust. A generic
 trust-manager concept needs separate design and authorization, not implementation
-here. Define valid-chain success, invalid/wrong-host/expired rejection, renewal,
+here. Define valid-chain success, verified-mode invalid/wrong-host/expired rejection, renewal,
 CA rotation and clear failure UX tests. Attribute actual evidence vs proposed tests.
 ```
 

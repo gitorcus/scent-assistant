@@ -13,16 +13,20 @@ authorize building/deploying a separate trust-management integration.
 ## Approved requirement: trust once, renew automatically
 
 Ordinary users must not need to obtain CA files or repeatedly approve routine
-certificate renewals. Preserve these requirements together:
+certificate renewals. They must also be able to explicitly choose HTTPS without
+certificate verification for their own environment. Preserve these requirements
+together:
 
 1. **Normal public trust first.** A valid vendor connection already trusted by
    HA requires no custom pin or extra approval.
-2. **Explicit initial approval when additional CA trust is needed.** During
-   cloud setup, identify the intended endpoint and proposed authority, present
-   its identity/fingerprint and trust scope, and obtain approval before storing
-   that trust or sending account credentials through it. Establish the CA's
-   identity through a documented trustworthy process; a confirmation dialog
-   alone does not authenticate whatever an unverified endpoint supplies.
+2. **Explicit choice when additional CA trust is needed.** During cloud setup,
+   identify the intended endpoint and proposed authority, present its
+   identity/fingerprint and trust scope, and offer distinct actions: approve the
+   CA and continue with verification; continue without certificate verification;
+   or cancel setup. Store no new CA without approval. In CA-verified mode,
+   establish the CA's identity through a documented trustworthy process before
+   credential-bearing requests; a confirmation dialog alone does not
+   authenticate whatever an unverified endpoint supplies.
 3. **Persist narrowly scoped CA trust.** Save the approved authority for the
    intended Scent Assistant cloud endpoint, surviving integration reloads and
    HA restarts. Do not add it to HA's global trust store. BLE-only setup is not
@@ -46,11 +50,32 @@ certificate renewals. Preserve these requirements together:
    changed; require approval before atomically replacing trust and reconnecting.
    Cancellation or a failed replacement test must not erase the saved approval
    or silently fall back to disabled verification.
-8. **Keep validation and recovery honest.** Continue hostname/chain validation;
+8. **Keep verified-mode validation and recovery honest.** Continue hostname/chain validation;
    reject invalid connections rather than treating initial approval as a
    permanent exception for expired or wrong-host certificates. An unexpected
    trust change raises a clear repair action for the affected cloud connection,
-   not routine renewal prompts or a failure of unrelated BLE entries.
+   not routine renewal prompts or a failure of unrelated BLE entries. Offer
+   re-pin or an explicit switch to verification-off mode; do not switch modes
+   automatically when verification fails.
+9. **Allow a persistent, user-selected verification-off mode.** Expose
+   "Continue without certificate verification" during setup and an equivalent
+   setting in later reconfiguration. The user need not approve a CA or justify
+   the choice. Explain once that HTTPS remains encrypted but does not verify
+   the server's identity, which permits interception by an impersonator. After
+   that explicit choice, credential-bearing cloud requests may use `ssl=False`.
+   Persist the selected mode for the intended connection across reload/restart;
+   do not block it solely on CA validation, repeatedly request trust approval,
+   or display it as verified. Keep a visible verification-off indication in
+   configuration/diagnostics, not recurring blocking prompts. Other network,
+   authentication and protocol failures still apply. Do not change global HA
+   behavior or unrelated connections. Switching back to a verified mode must
+   validate the selected trust before presenting it as working/verified.
+
+Reload preserves the selected verification mode and any saved trust; it never
+enrolls a new authority or silently changes verification policy. Re-pin is an
+explicit trust-management action, not a prerequisite for verification-off mode.
+Cancel means no enrollment and no new credential-bearing setup request. It is
+not the same action as deliberately continuing without verification.
 
 The approval/trust bootstrap mechanism, exact CA-pin representation and
 authenticated rotation mechanism remain implementation design details to
@@ -59,16 +84,25 @@ validate. They must satisfy the user-facing continuity and approval rules above.
 ## Acceptance checks for item #10
 
 - An already trusted public chain connects without a custom trust prompt.
-- Initial extra trust requires approval before credentials are sent; rejection
-  leaves no new stored approval and no credential-bearing request.
+- Initial CA-verified setup requires trust approval before credentials are sent.
+  Cancel leaves no new stored approval and no credential-bearing setup request.
+- Explicit Continue without certificate verification stores that mode and
+  permits HTTPS credential-bearing requests with `ssl=False`, without approving
+  or pinning a CA. No justification or recurring approval prompt is required.
+- Verification-off persists across reload/restart, remains visibly unverified,
+  and affects only the selected connection. Reconfiguration can switch modes;
+  selecting a verified mode tests validation before claiming verified success.
 - Restart and Reload trust retain the same approved authority.
 - A renewed valid server certificate under that authority succeeds automatically,
   with no user prompt. A proven CA transition also follows its tested automatic
   path; an unproven replacement does not.
 - Review and re-pin requires approval, updates only the intended connection,
   and preserves the old approval on cancellation or failed replacement.
-- Wrong-host, expired and untrusted chains fail clearly with no verification
-  bypass; unrelated entries and BLE operation remain unaffected.
+- In verified modes, wrong-host, expired and untrusted chains fail clearly with
+  no automatic downgrade. In explicitly selected verification-off mode, these
+  certificate-validation failures do not block operation; encryption remains
+  enabled and no verified-identity claim is made. Test the actual selected mode
+  at the HTTP boundary. Unrelated entries and BLE operation remain unaffected.
 - Trust setup, persistence, renewal, rotation and recovery tests run in an
   isolated supported HA runtime before production rollout. No current test
   result establishes this proposed behavior, because it is not implemented.
@@ -82,9 +116,12 @@ vendor root/intermediate is missing in HA, and whether verification currently
 works from the target HA runtime are **not established**. A valid connection
 from a developer's laptop would not answer the HA-runtime question.
 
-The goal is secure, working cloud access without asking typical users to obtain
-or install CA files. It is not simply removal of a flag, nor automatic acceptance
-of whichever certificate an unverified server supplies.
+The goal is usable verified cloud access without asking typical users to obtain
+or install CA files, while preserving their explicit choice to run without
+verification. This is not simply removal of a flag, silent enrollment of a CA,
+or automatic downgrade after failed verification. The current unconditional
+bypass is not evidence of an explicit user choice; this planned control and its
+disclosure do not exist in the reviewed beta.
 
 ## Existing Home Assistant facilities
 
@@ -124,7 +161,9 @@ do not turn that limited search into a claim that no such project exists.
    API adoption, ownership, scope, authenticated trust bootstrap, updates,
    removal and rollback before building it.
 5. Require working normal connections and rejection of untrusted, expired and
-   wrong-host certificates. Include routine certificate renewal and legitimate
+   wrong-host certificates in verified modes. Separately test explicit
+   verification-off selection, its persistence and truthful diagnostics.
+   Include routine certificate renewal and legitimate
    CA rotation without manual intervention, and a comprehensible repair message
    when automatic authenticated recovery is not possible.
 

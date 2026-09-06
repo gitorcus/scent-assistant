@@ -38,7 +38,7 @@ Their line references point to the pinned, unchanged integration source.
 | Schedule targeting and preservation | Inherited defect | Ordinary entity targets reach no device; omitted target broadcasts. Duration-only AK edits and cloud disable requests can enable a program. Reproduced offline. |
 | Operation and timer ownership | Inherited defects, more concurrency from beta refresh | Connected fast path bypasses the connection lock; failed retrigger discards an existing cutoff; two simultaneous starts leave two timers with one stored handle. Reproduced offline. Wider handshake/chunk/unload interleavings are source-reviewed, not all reproduced. |
 | Explicit clock sync | Inherited defect plus proposed feature gap | Connected Sync Time returns success with no write. Reproduced. Eight-hour maintenance/result reporting is not implemented in this beta. |
-| Cloud certificate verification (#10 / SEC-1) | Inherited defect; active approved remediation requirement, not implemented | HTTPS is encrypted but certificate verification is bypassed. Diagnose HA trust compatibility, then preserve the approved trust-once/automatic-renewal contract, with separate reload and explicit re-pin actions. No longer deferred; see certificate trust requirement. |
+| Cloud certificate verification (#10 / SEC-1) | Inherited defect; active approved remediation requirement, not implemented | HTTPS is encrypted but certificate verification is unconditionally bypassed. Add verified trust-once/automatic-renewal handling, separate reload/re-pin actions, and a persistent explicit option to continue without certificate verification. No silent downgrade; see certificate trust requirement. |
 | Sensitive diagnostics/logging | Inherited defects | A synthetic GW password survives as encoded raw command data; a synthetic cloud token appears in DEBUG logs. No real credentials accessed. |
 | Invalid response/state handling | Inherited semantic-validation gaps plus new beta status path | A checksum-valid beta response with invalid power/status bytes becomes off. GW assembly is unbounded; several JSON fields are not semantically validated. Synthetic probes only. |
 | Oil freshness | Proposed contract gap, not a broken general timestamp | The beta's `last_device_update` is device-wide; it cannot prove when oil was read. Keep it if useful and add oil-specific evidence rather than silently changing its meaning. |
@@ -68,7 +68,11 @@ is to approve additional CA trust once when needed, persist it for the intended
 endpoint, accept normal valid renewals automatically, support authenticated CA
 transitions, and request approval only for genuinely new untrusted authority.
 Provide separate Reload trust and Review and re-pin actions. This requirement
-does not mark the defect fixed or authorize a production trust-store change.
+also preserves an explicit, persistent "Continue without certificate verification"
+choice (`ssl=False`, still HTTPS), distinct from Cancel. Users do not need to
+approve a CA or justify that choice. Verified-mode failures must not silently
+switch modes, and deliberately unverified connections must not be labeled
+verified. This does not mark the defect fixed or authorize a production change.
 
 ## Executed validation
 
@@ -136,7 +140,9 @@ exclude the disposable environment before publishing source work.
    checks](certificate-trust.md#acceptance-checks-for-item-10): diagnose actual
    HA compatibility, initial approval, persistent scoped trust, automatic normal
    renewal, authenticated transitions, reload and explicit re-pin recovery.
-   Confirm ordinary users need neither manual CA files nor renewal reapproval.
+   Include explicit verification-off selection, persistence and switching back
+   to verification. Confirm users need neither manual CA files nor renewal
+   reapproval and are not forced to approve a CA to use the opt-out mode.
 5. Inventory installed custom changes and downstream interfaces, including
    saved durations and clock/run ownership. This review did not inspect them.
 6. Prepare exact candidate/source hashes, data migration and rollback, obtain
