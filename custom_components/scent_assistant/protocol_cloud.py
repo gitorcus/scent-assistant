@@ -78,14 +78,19 @@ class AromaLinkCloudClient:
 
     @staticmethod
     def _response_ok(data: dict | list | None) -> bool:
-        """Determine whether an Aroma-Link API response indicates success."""
+        """Determine whether an Aroma-Link API response indicates success.
+
+        Non-null codes take precedence over the success flag and message.
+        Boolean codes are rejected. Missing or null codes retain the existing
+        success flag and message fallback.
+        """
         if isinstance(data, dict):
             code = data.get("code")
             success = data.get("success")
             msg = str(data.get("msg", "")).lower()
 
-            if code in (200, "200", 0, "0"):
-                return True
+            if code is not None:
+                return not isinstance(code, bool) and code in (200, "200", 0, "0")
             if success is True:
                 return True
             if msg in ("success", "ok", "operate success", "operation success"):
